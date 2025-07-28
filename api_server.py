@@ -17,9 +17,35 @@ app = FastAPI(
     version="2.0.0"
 )
 
+# CORS ayarları
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Tüm kaynaklara izin ver (geliştirme için)
+    allow_credentials=True,
+    allow_methods=["*"],  # Tüm metodlara izin ver
+    allow_headers=["*"],  # Tüm başlıklara izin ver
+)
+
 # VM oluşturma durumlarını takip etmek için
 vm_creation_status = {}
 executor = ThreadPoolExecutor(max_workers=3)
+
+def format_bytes(byte_val):
+    """Byte değerini okunabilir bir formata (KB, MB, GB) dönüştürür."""
+    if byte_val is None:
+        return "N/A"
+    try:
+        b = int(byte_val)
+        if b < 1024:
+            return f"{b}B"
+        elif b < 1024**2:
+            return f"{b/1024:.1f}KB"
+        elif b < 1024**3:
+            return f"{b/1024**2:.1f}MB"
+        else:
+            return f"{b/1024**3:.1f}GB"
+    except (ValueError, TypeError):
+        return "N/A"
 
 def run_multipass_command(command: list, timeout=300):
     """Verilen multipass komutunu çalıştırır ve çıktıyı döner."""
@@ -135,50 +161,54 @@ def get_vm_creation_status(vm_name: str):
 def list_vms():
     """Tüm multipass sanal makinelerini detaylı bilgileriyle birlikte JSON formatında listeler."""
     try:
-        # Önce basit liste al
-        result_json = run_multipass_command(["multipass", "list", "--format", "json"])
-        vm_list_data = json.loads(result_json)
+        # Temel VM listesini al
+        list_result_json = run_multipass_command(["multipass", "list", "--format", "json"])
+        vm_list_data = json.loads(list_result_json)
         
-        # Her VM için detaylı bilgi al
         detailed_vms = []
-        for vm in vm_list_data.get("list", []):
-            vm_name = vm.get("name")
+        for vm_summary in vm_list_data.get("list", []):
+            vm_name = vm_summary.get("name")
+            if not vm_name:
+                continue
+
             try:
-                # Detaylı bilgi al
-                info_result = run_multipass_command(["multipass", "info", vm_name, "--format", "json"], timeout=30)
-                vm_info = json.loads(info_result)
-                
-                # Sadece ilgili VM'in bilgisini al
-                if vm_name in vm_info.get("info", {}):
-                    vm_details = vm_info["info"][vm_name]
-                    
-                    # Temel bilgileri çıkar
+                # Her VM için detaylı bilgi al
+                info_result_json = run_multipass_command(["multipass", "info", vm_name, "--format", "json"], timeout=30)
+                vm_info_data = json.loads(info_result_json)
+
+                # Dinamik anahtarlı VM detayını al (örn: info['ege'])
+                vm_details = vm_info_data.get("info", {}).get(vm_name)
+
+                if vm_details:
+                    # Detaylı bilgileri güvenli bir şekilde çıkar
+                    memory_info = vm_details.get("memory", {})
+                    disk_info = vm_details.get("disks", {}).get("sda1", {})
+
                     detailed_vm = {
                         "name": vm_name,
-                        "state": vm_details.get("state", "unknown"),
+                        "state": vm_details.get("state", "N/A"),
                         "ipv4": vm_details.get("ipv4", []),
-                        "memory": vm_details.get("memory", {}).get("total", "N/A"),
-                        "disk": vm_details.get("disks", {}).get("sda1", {}).get("total", "N/A"), 
-                        "cpus": vm_details.get("cpus", "N/A"),
-                        "image": vm_details.get("image_hash", "N/A"),
-                        "release": vm_details.get("release", "N/A")
+                        "release": vm_details.get("release", "N/A"),
+                        "cpus": vm_details.get("cpu_count", "N/A"),
+                        "image_hash": vm_details.get("image_hash", "N/A"),
+                        "memory": f"{format_bytes(memory_info.get('used'))} / {format_bytes(memory_info.get('total'))}",
+                        "disk": f"{format_bytes(disk_info.get('used'))} / {format_bytes(disk_info.get('total'))}",
                     }
                     detailed_vms.append(detailed_vm)
                 else:
-                    # Temel bilgiyi kullan
-                    detailed_vms.append(vm)
-                    
+                    # Detay alınamazsa temel bilgiyi kullan
+                    detailed_vms.append(vm_summary)
+
             except Exception as e:
-                print(f"VM {vm_name} detayları alınamadı: {e}")
-                # Temel bilgiyi kullan
-                detailed_vms.append(vm)
+                print(f"'{vm_name}' için detay alınamadı: {e}")
+                # Hata durumunda temel bilgiyi kullan
+                detailed_vms.append(vm_summary)
         
         return {"list": detailed_vms, "total": len(detailed_vms)}
-        
-    except json.JSONDecodeError:
-        # JSON parse edilemezse basit format dene
-        result_text = run_multipass_command(["multipass", "list"])
-        return {"raw_output": result_text, "error": "JSON formatı parse edilemedi"}
+
+    except Exception as e:
+        print(f"VM listesi alınırken genel bir hata oluştu: {e}")
+        raise HTTPException(status_code=500, detail="VM listesi alınırken sunucuda bir hata oluştu.")
 
 @app.get("/vms/info/{vm_name}", summary="VM Detaylarını Al")
 def get_vm_info(vm_name: str):

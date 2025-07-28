@@ -2,6 +2,9 @@ import os
 import requests
 import json
 import logging
+import re
+import shlex
+from typing import Dict, List, Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -18,6 +21,7 @@ log = logging.getLogger("proxy_agent")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "mistral-faiss-rag:latest")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "120"))
+API_SERVER_URL = os.getenv("API_SERVER_URL", "http://localhost:8000")
 
 # --- Pydantic Model ---
 class ChatMessage(BaseModel):
@@ -42,6 +46,98 @@ app.add_middleware(
 
 # --- In-memory conversation store ---
 conversation_histories = {}
+
+# --- Command Execution Logic ---
+
+def extract_multipass_commands(text: str) -> List[str]:
+    """Extracts all multipass commands from a given text block."""
+    # ```multipass ...``` veya "multipass ..." formatındaki komutları arar
+    pattern = r"(?:`{3}|\"|')(multipass(?:(?!`{3}|\"|').)*)(?:`{3}|\"|')"
+    commands = re.findall(pattern, text, re.DOTALL)
+    # Komutları temizle (başındaki/sonundaki boşluklar)
+    return [cmd.strip() for cmd in commands]
+
+def parse_launch_command(command: str) -> Optional[Dict]:
+    """Parses a multipass launch command into a dictionary for the API server."""
+    try:
+        args = shlex.split(command)
+        if not (args[0] == 'multipass' and args[1] == 'launch'):
+            return None
+
+        params = {}
+        # Komutu sözlüğe çevir
+        # Örnek: ['multipass', 'launch', '--name', 'new-vm', '--mem', '1G']
+        # -> {'name': 'new-vm', 'mem': '1G'}
+        i = 2
+        while i < len(args):
+            if args[i].startswith('--'):
+                key = args[i][2:]
+                # Değerli parametreler (örn: --name my-vm)
+                if i + 1 < len(args) and not args[i+1].startswith('--'):
+                    params[key] = args[i+1]
+                    i += 2
+                # Değersiz parametreler (örn: --cloud-init file.yaml)
+                else:
+                    # Bu senaryo şimdilik basit tutulmuştur
+                    i += 1
+            else:
+                # İsimsiz argümanlar (örn: 'ubuntu' gibi bir imaj adı)
+                if 'image' not in params:
+                     params['image'] = args[i]
+                i += 1
+        
+        # 'name' parametresi zorunludur
+        if 'name' not in params:
+            log.warning(f"'launch' komutunda 'name' parametresi eksik: {command}")
+            return None
+
+        return params
+    except Exception as e:
+        log.error(f"Komut ayrıştırma hatası: {command} | Hata: {e}")
+        return None
+
+def execute_multipass_command(command: str) -> Dict:
+    """Executes a command by calling the API server."""
+    log.info(f"⚡️ Multipass komutu çalıştırılıyor: {command}")
+    
+    try:
+        args = shlex.split(command)
+        if len(args) < 2 or args[0] != 'multipass':
+            return {"success": False, "operation": command, "details": "Geçersiz multipass komutu."}
+
+        action = args[1]
+        vm_name = args[2] if len(args) > 2 else None
+
+        endpoint_map = {
+            'start': ('post', f'/vms/start/{vm_name}'),
+            'stop': ('post', f'/vms/stop/{vm_name}'),
+            'delete': ('delete', f'/vms/delete/{vm_name}')
+        }
+
+        if action == 'launch':
+            vm_config = parse_launch_command(command)
+            if not vm_config:
+                return {"success": False, "operation": command, "details": "'launch' komutu ayrıştırılamadı."}
+            response = requests.post(f"{API_SERVER_URL}/vms/create", json=vm_config, timeout=20)
+        
+        elif action in endpoint_map:
+            if not vm_name:
+                return {"success": False, "operation": command, "details": f"'{action}' için makine adı gerekli."}
+            method, endpoint = endpoint_map[action]
+            response = requests.request(method, f"{API_SERVER_URL}{endpoint}", timeout=20)
+        
+        else:
+            return {"success": False, "operation": command, "details": f"'{action}' komutu henüz desteklenmiyor."}
+
+        response.raise_for_status()
+        return {"success": True, "operation": command, "details": response.json()}
+
+    except requests.RequestException as e:
+        log.error(f"API sunucusuna bağlanılamadı: {e}")
+        return {"success": False, "operation": command, "details": f"API sunucusuna ulaşılamadı: {str(e)}"}
+    except Exception as e:
+        log.error(f"Komut çalıştırılırken hata: {e}")
+        return {"success": False, "operation": command, "details": f"Beklenmedik bir hata oluştu: {str(e)}"}
 
 # --- Ollama Proxy Class ---
 class OllamaProxy:
@@ -166,7 +262,16 @@ async def chat(chat_message: ChatMessage, request: Request):
 
     if session_id not in conversation_histories:
         conversation_histories[session_id] = [
-            {"role": "system", "content": "Sen, Multipass sanal makinelerini yöneten ve her zaman Türkçe cevap veren yardımsever bir asistansın. Kullanıcının komutlarını yorumla ve VM işlemleri için yardımcı ol."}
+            {
+                "role": "system",
+                "content": (
+                    "Sen, Multipass sanal makinelerini yöneten ve her zaman Türkçe cevap veren yardımsever bir asistansın. "
+                    "Kullanıcının komutlarını yorumla ve VM işlemleri için yardımcı ol."
+                    "Çalıştırılması gereken tüm multipass komutlarını HER ZAMAN şu formatta ver: ```multipass ...```. "
+                    "Örneğin: ```multipass launch --name test-vm --mem 2G --disk 10G```. "
+                    "Başka bir metinle birlikte komutları açıklayabilirsin ama komutlar mutlaka backtick içinde olmalı."
+                )
+            }
         ]
 
     history = conversation_histories[session_id]
@@ -179,8 +284,20 @@ async def chat(chat_message: ChatMessage, request: Request):
         result = ollama_proxy.run(history)
 
         if result and 'response' in result:
-            history.append({"role": "assistant", "content": result['response']})
+            ai_response_text = result['response']
+            history.append({"role": "assistant", "content": ai_response_text})
             conversation_histories[session_id] = history
+
+            # Komutları ayıkla ve çalıştır
+            commands_to_run = extract_multipass_commands(ai_response_text)
+            execution_results = []
+            if commands_to_run:
+                for cmd in commands_to_run:
+                    exec_result = execute_multipass_command(cmd)
+                    execution_results.append(exec_result)
+            
+            # Yanıta çalıştırma sonuçlarını ekle
+            result['execution_results'] = execution_results
 
         return result
 
@@ -192,9 +309,29 @@ async def chat(chat_message: ChatMessage, request: Request):
         raise HTTPException(status_code=500, detail="Sunucu hatası oluştu.")
 
 @app.get("/vms/list")
-async def list_vms_mock():
-    log.info("📥 /vms/list mock endpoint çağrıldı.")
-    return {"success": True, "vms": []}
+async def list_vms():
+    """Fetches the list of VMs from the API server and transforms it for the frontend."""
+    log.info(f"🔄 /vms/list isteği {API_SERVER_URL}/vms/list adresine yönlendiriliyor")
+    try:
+        response = requests.get(f"{API_SERVER_URL}/vms/list", timeout=15)
+        response.raise_for_status()
+        data_from_api = response.json()
+        
+        # Frontend'in beklediği formata dönüştür: {"success": true, "vms": [...]}
+        # api_server'dan gelen format: {"list": [...], "total": ...}
+        transformed_data = {
+            "success": True,
+            "vms": data_from_api.get("list", [])
+        }
+        return transformed_data
+        
+    except requests.RequestException as e:
+        log.error(f"VM listesi alınırken hata: {e}")
+        # Hata durumunda frontend'in beklediği formatta bir hata mesajı gönder
+        return {"success": False, "vms": [], "error": "VM yönetim API'sine ulaşılamadı."}
+    except Exception as e:
+        log.error(f"VM listesi işlenirken beklenmedik hata: {e}")
+        return {"success": False, "vms": [], "error": "Sunucuda beklenmedik bir hata oluştu."}
 
 # Çalıştırma komutu:
 # uvicorn proxy_agent:app --host 0.0.0.0 --port 5001 --reload
