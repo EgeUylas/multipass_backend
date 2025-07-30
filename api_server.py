@@ -13,6 +13,12 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 from dotenv import load_dotenv
 import asyncio
+import logging
+import traceback
+
+# Logging yapılandırması
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # .env dosyasını yükle
 load_dotenv()
@@ -34,6 +40,12 @@ app.add_middleware(
 # VM oluşturma durumlarını takip etmek için
 vm_creation_status: Dict[str, Dict] = {}
 executor = ThreadPoolExecutor(max_workers=3)
+
+# Config sınıfı
+class Config:
+    REQUEST_TIMEOUT = 30.0
+
+config = Config()
 
 # --- Pydantic Modelleri ---
 class VM(BaseModel):
@@ -58,7 +70,6 @@ class CreateVMRequest(BaseModel):
     name: str = Field(..., description="Oluşturulacak sanal makinenin adı.")
     config: Dict[str, str] = Field({}, description="Multipass launch komutu için ek yapılandırma.")
 
-# AI Proxy için Pydantic Modelleri
 class ChatRequest(BaseModel):
     model: str
     messages: List[Dict[str, str]]
@@ -86,124 +97,176 @@ def format_bytes(byte_val):
 
 def run_multipass_command(command: list, timeout=300):
     try:
-        if command[0] == "multipass": 
-            command[0] = os.getenv("MULTIPASS_BIN", "multipass")
-        
-        print(f"Çalıştırılacak komut: {' '.join(command)}")  # Debug için
-        
+        multipass_path = os.getenv("MULTIPASS_BIN", r"C:\Program Files\Multipass\bin\multipass.exe")
+        logger.info(f"Multipass path: {multipass_path}")
+
+        if not os.path.exists(multipass_path):
+            logger.error(f"Multipass executable not found at path: {multipass_path}")
+            return {"error": f"Multipass executable not found at path: {multipass_path}"}
+
+        command[0] = multipass_path
+        command_str = ' '.join(f'"{c}"' if ' ' in c else c for c in command)
+        logger.info(f"Executing command: {command_str}")
+
         result = subprocess.run(
-            command, 
-            capture_output=True, 
-            text=True, 
-            check=True, 
+            command_str,
+            capture_output=True,
+            text=True,
+            check=True,
             timeout=timeout,
-            shell=False  # Windows uyumluluğu için
+            shell=True,
+            encoding='utf-8',
+            errors='replace'
         )
-        return result.stdout
-    except FileNotFoundError:
-        raise HTTPException(500, f"Multipass bulunamadı. 'multipass' komutu PATH'de mevcut değil veya kurulu değil.")
-    except subprocess.CalledProcessError as e:
-        error_message = e.stderr.strip() if e.stderr else str(e)
-        if "does not exist" in error_message: 
-            raise HTTPException(404, error_message)
-        raise HTTPException(500, f"Multipass komutu başarısız: {error_message}")
-    except subprocess.TimeoutExpired:
-        raise HTTPException(504, f"Komut zaman aşımına uğradı: {' '.join(command)}")
-    except FileNotFoundError:
-        raise HTTPException(500, f"Multipass bulunamadı. 'multipass' komutu PATH'de mevcut değil veya kurulu değil.")
-    except subprocess.CalledProcessError as e:
-        error_message = e.stderr.strip() if e.stderr else str(e)
-        if "does not exist" in error_message: 
-            raise HTTPException(404, error_message)
-        raise HTTPException(500, f"Multipass komutu başarısız: {error_message}")
-    except subprocess.TimeoutExpired:
-        raise HTTPException(504, f"Komut zaman aşımına uğradı: {' '.join(command)}")
-
-# --- AI ve Komut İşleme Fonksiyonları ---
-def extract_multipass_command(text: str) -> Optional[str]:
-    """Metin içinden multipass komutunu, çeşitli formatlarda arayarak çıkarır ve düzeltir."""
-    print(f"Komut çıkarma deneniyor: {text[:200]}...")  # Debug
-    
-    # 1. Markdown kod bloğu (```multipass ...``` veya ```bash multipass ...```)
-    patterns = [
-        r"```multipass\s+(.*?)\s*```",
-        r"```bash\s*multipass\s+(.*?)\s*```", 
-        r"```\s*multipass\s+(.*?)\s*```",
-        r"`multipass\s+(.*?)`"
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, text, re.DOTALL)
-        if match:
-            command = match.group(1).strip()
-            print(f"Markdown'dan çıkarılan komut: {command}")  # Debug
-            return normalize_multipass_command(command)
-
-    # 2. Satır satır arama
-    lines = text.split('\n')
-    for line in lines:
-        cleaned_line = line.strip()
         
-        # Tırnak işaretlerini kaldır (varsa)
-        if (cleaned_line.startswith("'") and cleaned_line.endswith("'")) or \
-           (cleaned_line.startswith('"') and cleaned_line.endswith('"')):
-            cleaned_line = cleaned_line[1:-1]
+        logger.info(f"Command executed successfully")
+        return {"success": True, "output": result.stdout}
 
-        if cleaned_line.startswith("multipass "):
-            # "multipass " önekini kaldır ve komutu döndür
-            command = cleaned_line[len("multipass "):].strip()
-            print(f"Satırdan çıkarılan komut: {command}")  # Debug
+    except FileNotFoundError as e:
+        logger.error(f"FileNotFoundError: {e}")
+        return {"error": f"Multipass command failed. Ensure '{multipass_path}' is correct."}
+    except subprocess.CalledProcessError as e:
+        error_message = e.stderr.strip() if e.stderr else str(e)
+        logger.error(f"Multipass command error: {error_message}")
+        return {"error": f"Multipass command failed: {error_message}"}
+    except subprocess.TimeoutExpired as e:
+        logger.error(f"Command timed out: {command_str}")
+        return {"error": "Command timed out"}
+    except Exception as e:
+        logger.error(f"Unexpected error in run_multipass_command: {e}")
+        return {"error": f"Unexpected error: {str(e)}"}
+
+def run_multipass_command_old(command: list, timeout=300):
+    """Eski endpoint'ler için uyumluluk (exception fırlatan versiyon)"""
+    try:
+        multipass_path = os.getenv("MULTIPASS_BIN", r"C:\Program Files\Multipass\bin\multipass.exe")
+        logger.info(f"Multipass path: {multipass_path}")
+
+        if not os.path.exists(multipass_path):
+            logger.error(f"Multipass executable not found at path: {multipass_path}")
+            raise HTTPException(status_code=500, detail=f"Multipass executable not found at path: {multipass_path}")
+
+        command[0] = multipass_path
+        command_str = ' '.join(f'"{c}"' if ' ' in c else c for c in command)
+        logger.info(f"Executing command: {command_str}")
+
+        result = subprocess.run(
+            command_str,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=timeout,
+            shell=True,
+            encoding='utf-8',
+            errors='replace'
+        )
+        
+        logger.info(f"Command executed successfully")
+        return result.stdout
+
+    except FileNotFoundError as e:
+        logger.error(f"FileNotFoundError: {e}")
+        raise HTTPException(500, f"Multipass command failed. Ensure '{multipass_path}' is correct.")
+    except subprocess.CalledProcessError as e:
+        error_message = e.stderr.strip() if e.stderr else str(e)
+        logger.error(f"Multipass command error: {error_message}")
+        if "does not exist" in error_message:
+            raise HTTPException(404, error_message)
+        raise HTTPException(500, f"Multipass command failed: {error_message}")
+    except subprocess.TimeoutExpired as e:
+        logger.error(f"Command timed out: {command_str}")
+        raise HTTPException(504, f"Command timed out")
+    except Exception as e:
+        logger.error(f"Unexpected error in run_multipass_command: {e}")
+        raise HTTPException(500, f"Unexpected error: {str(e)}")
+
+def extract_multipass_command(text: str) -> Optional[str]:
+    """Metin içinden multipass komutunu çıkarır."""
+    try:
+        logger.info(f"Komut çıkarma deneniyor: {text[:200]}...")
+        
+        # 1. Markdown kod bloğu
+        patterns = [
+            r"```multipass\s+(.*?)\s*```",
+            r"```bash\s*multipass\s+(.*?)\s*```", 
+            r"```\s*multipass\s+(.*?)\s*```",
+            r"`multipass\s+(.*?)`"
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text, re.DOTALL)
+            if match:
+                command = match.group(1).strip()
+                logger.info(f"Markdown'dan çıkarılan komut: {command}")
+                return normalize_multipass_command(command)
+
+        # 2. Satır satır arama
+        lines = text.split('\n')
+        for line in lines:
+            cleaned_line = line.strip()
+            
+            if (cleaned_line.startswith("'") and cleaned_line.endswith("'")) or \
+               (cleaned_line.startswith('"') and cleaned_line.endswith('"')):
+                cleaned_line = cleaned_line[1:-1]
+
+            if cleaned_line.startswith("multipass "):
+                command = cleaned_line[len("multipass "):].strip()
+                logger.info(f"Satırdan çıkarılan komut: {command}")
+                return normalize_multipass_command(command)
+        
+        # 3. Basit regex araması
+        simple_match = re.search(r"multipass\s+(\w+(?:\s+--?\w+(?:\s+\S+)?)*)", text)
+        if simple_match:
+            command = simple_match.group(1).strip()
+            logger.info(f"Regex'den çıkarılan komut: {command}")
             return normalize_multipass_command(command)
-    
-    # 3. Basit regex araması
-    simple_match = re.search(r"multipass\s+(\w+(?:\s+--?\w+(?:\s+\S+)?)*)", text)
-    if simple_match:
-        command = simple_match.group(1).strip()
-        print(f"Regex'den çıkarılan komut: {command}")  # Debug
-        return normalize_multipass_command(command)
-    
-    print("Hiçbir komut bulunamadı")  # Debug       
-    return None
+        
+        logger.info("Hiçbir komut bulunamadı")
+        return None
+        
+    except Exception as e:
+        logger.error(f"extract_multipass_command hatası: {e}")
+        return None
 
 def normalize_multipass_command(command: str) -> str:
-    """Multipass komutlarını normalize eder (create -> launch, kısa parametreler -> uzun)"""
-    # create -> launch dönüşümü
-    if command.startswith("create"):
-        command = command.replace("create", "launch", 1)
-    
-    # Kısa parametreleri uzun parametrelere çevir
-    replacements = {
-        " -n ": " --name ",
-        " -m ": " --memory ",
-        " -d ": " --disk ",
-        " -c ": " --cpus "
-    }
-    
-    for short, long in replacements.items():
-        command = command.replace(short, long)
-    
-    return command
+    """Multipass komutlarını normalize eder."""
+    try:
+        if command.startswith("create"):
+            command = command.replace("create", "launch", 1)
+        
+        replacements = {
+            " -n ": " --name ",
+            " -m ": " --memory ",
+            " -d ": " --disk ",
+            " -c ": " --cpus "
+        }
+        
+        for short, long in replacements.items():
+            command = command.replace(short, long)
+        
+        return command
+    except Exception as e:
+        logger.error(f"normalize_multipass_command hatası: {e}")
+        return command
 
 async def execute_vm_action_direct(command: str) -> Dict[str, Any]:
     """Doğrudan Multipass komutunu çalıştırır."""
     try:
-        # Komutu normalize et
-        command = normalize_multipass_command(command)
+        logger.info(f"execute_vm_action_direct başlatıldı: {command}")
         
-        # Komutu güvenli bir şekilde ayrıştır
+        command = normalize_multipass_command(command)
         args = shlex.split(command)
         
-        # Eğer komut 'multipass' ile başlıyorsa kaldır
         if args and args[0] == 'multipass':
             args = args[1:]
             
         if not args:
-            return {"error": "Geçersiz komut"}
+            return {"success": False, "error": "Geçersiz komut"}
             
         action = args[0]
+        logger.info(f"Action: {action}")
         
         if action == "launch":
-            # launch --name vm-name --cpus 2 --memory 1G --disk 4G ...
             vm_name = None
             vm_config = {}
             
@@ -213,10 +276,9 @@ async def execute_vm_action_direct(command: str) -> Dict[str, Any]:
                     vm_name = args[i + 1]
                     i += 2
                 elif args[i].startswith("--") and i + 1 < len(args):
-                    key = args[i][2:]  # -- önekini kaldır
+                    key = args[i][2:]
                     value = args[i + 1]
                     
-                    # Özel işlem gerektiren parametreler
                     if key in ['cpus', 'disk', 'memory']:
                         vm_config[key] = value
                     elif key == 'disk-size':
@@ -227,143 +289,169 @@ async def execute_vm_action_direct(command: str) -> Dict[str, Any]:
                     i += 1
             
             if not vm_name:
-                return {"error": "VM adı belirtilmedi"}
+                return {"success": False, "error": "VM adı belirtilmedi"}
             
-            # VM oluştur (asenkron)
-            create_request = CreateVMRequest(name=vm_name, config=vm_config)
-            # create_vm_async fonksiyonunu çağır
-            return await create_vm_async(create_request)
+            # Asenkron VM oluşturma başlat
+            asyncio.create_task(async_create_vm_background(vm_name, vm_config))
+            
+            return {
+                "success": True, 
+                "message": f"'{vm_name}' oluşturma işlemi başlatıldı. Durumu kontrol etmek için /vms/status/{vm_name} endpoint'ini kullanabilirsiniz.",
+                "status": "started"
+            }
             
         elif action == "start":
             if len(args) < 2:
-                return {"error": "VM adı belirtilmedi"}
+                return {"success": False, "error": "VM adı belirtilmedi"}
             vm_name = args[1]
-            result = start_vm(vm_name)
-            return {"success": True, "message": result.message, "status": result.status}
+            
+            full_command = [os.getenv("MULTIPASS_BIN", "multipass")] + args
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(executor, run_multipass_command, full_command)
+            
+            if "error" in result:
+                return {"success": False, "error": result["error"]}
+            
+            return {"success": True, "message": f"'{vm_name}' başlatıldı.", "status": "success"}
             
         elif action == "stop":
             if len(args) < 2:
-                return {"error": "VM adı belirtilmedi"}
+                return {"success": False, "error": "VM adı belirtilmedi"}
             vm_name = args[1]
-            result = stop_vm(vm_name)
-            return {"success": True, "message": result.message, "status": result.status}
+            
+            full_command = [os.getenv("MULTIPASS_BIN", "multipass")] + args
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(executor, run_multipass_command, full_command)
+            
+            if "error" in result:
+                return {"success": False, "error": result["error"]}
+            
+            return {"success": True, "message": f"'{vm_name}' durduruldu.", "status": "success"}
             
         elif action == "delete":
             if len(args) < 2:
-                return {"error": "VM adı belirtilmedi"}
+                return {"success": False, "error": "VM adı belirtilmedi"}
             vm_name = args[1]
-            result = delete_vm(vm_name)
-            return {"success": True, "message": result.message, "status": result.status}
+            
+            # Delete komutu
+            delete_command = [os.getenv("MULTIPASS_BIN", "multipass"), "delete", vm_name]
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(executor, run_multipass_command, delete_command)
+            
+            if "error" in result:
+                return {"success": False, "error": result["error"]}
+            
+            # Purge komutu
+            purge_command = [os.getenv("MULTIPASS_BIN", "multipass"), "purge"]
+            purge_result = await loop.run_in_executor(executor, run_multipass_command, purge_command)
+            
+            return {"success": True, "message": f"'{vm_name}' silindi ve temizlendi.", "status": "success"}
+            
+        elif action == "purge":
+            # Sadece purge komutu
+            purge_command = [os.getenv("MULTIPASS_BIN", "multipass"), "purge"]
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(executor, run_multipass_command, purge_command)
+            
+            if "error" in result:
+                return {"success": False, "error": result["error"]}
+            
+            return {"success": True, "message": "Silinen sanal makineler tamamen temizlendi.", "status": "success"}
             
         else:
-            # Diğer tüm komutları doğrudan çalıştır
-            try:
-                # Komutun başına multipass path'ini ekle
-                full_command = [config.MULTIPASS_BIN] + args
-                output = run_multipass_command(full_command)
-                return {"success": True, "message": output, "status": "success"}
-            except Exception as e:
-                return {"success": False, "error": str(e), "status": "error"}
+            full_command = [os.getenv("MULTIPASS_BIN", "multipass")] + args
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(executor, run_multipass_command, full_command)
+            
+            if "error" in result:
+                return {"success": False, "error": result["error"]}
+            
+            return {"success": True, "message": result.get("output", "Komut başarıyla çalıştırıldı"), "status": "success"}
     
     except Exception as e:
-        return {"error": f"Komut çalıştırma hatası: {str(e)}"}
+        logger.error(f"execute_vm_action_direct genel hatası: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return {"success": False, "error": f"Komut çalıştırma hatası: {str(e)}"}
 
-# --- Yardımcı Fonksiyonlar (Asenkron VM Oluşturma) ---
+# --- VM İşlemleri ---
 async def async_create_vm_background(vm_name: str, config_dict: Dict):
-    """Arka planda VM oluşturur ve durumu günceller"""
+    """Arka planda VM oluşturur."""
     try:
         vm_creation_status[vm_name] = {"status": "creating", "message": f"'{vm_name}' oluşturuluyor..."}
         
-        # Güvenli karakter kontrolü
         if not vm_name.replace('-', '').replace('_', '').isalnum():
             vm_creation_status[vm_name] = {"status": "error", "message": "VM adı sadece harf, rakam, tire ve alt çizgi içerebilir."}
             return
 
-        # Multipass için geçerli parametreler
         allowed_params = {
             "mem": "--memory", "memory": "--memory", "disk": "--disk", "cpus": "--cpus"
         }
 
-        # Temel komutu oluştur - doğrudan multipass binary path'ini kullan
-        command = [config.MULTIPASS_BIN, "launch", "--name", vm_name]
+        command = [os.getenv("MULTIPASS_BIN", "multipass"), "launch", "--name", vm_name]
 
-        # Parametreleri ekle
         for key, value in config_dict.items():
             if key in allowed_params and value:
                 command.extend([allowed_params[key], str(value)])
         
-        # VM'i oluştur
         loop = asyncio.get_event_loop()
-        output = await loop.run_in_executor(executor, run_multipass_command, command, 600)
+        result = await loop.run_in_executor(executor, run_multipass_command, command, 600)
         
-        # VM'in oluştuğunu doğrula
+        if "error" in result:
+            vm_creation_status[vm_name] = {
+                "status": "error", 
+                "message": f"VM oluşturma hatası: {result['error']}"
+            }
+            return
+        
         time.sleep(3)
+        
+        # VM bilgilerini al
         try:
             info_result = await loop.run_in_executor(executor, run_multipass_command, ["multipass", "info", vm_name, "--format", "json"])
-            vm_info = json.loads(info_result)
-            vm_creation_status[vm_name] = {
-                "status": "completed", 
-                "message": f"'{vm_name}' başarıyla oluşturuldu!",
-                "vm_info": vm_info
-            }
-        except:
+            if "error" not in info_result:
+                vm_info = json.loads(info_result["output"])
+                vm_creation_status[vm_name] = {
+                    "status": "completed", 
+                    "message": f"'{vm_name}' başarıyla oluşturuldu!",
+                    "vm_info": vm_info
+                }
+            else:
+                vm_creation_status[vm_name] = {
+                    "status": "completed", 
+                    "message": f"'{vm_name}' oluşturuldu ancak detaylar alınamadı."
+                }
+        except Exception as info_error:
+            logger.error(f"VM info alınamadı: {info_error}")
             vm_creation_status[vm_name] = {
                 "status": "completed", 
                 "message": f"'{vm_name}' oluşturuldu ancak detaylar alınamadı."
             }
             
     except Exception as e:
+        logger.error(f"async_create_vm_background hatası: {e}")
         vm_creation_status[vm_name] = {
             "status": "error", 
             "message": f"VM oluşturma hatası: {str(e)}"
         }
 
 # --- API Endpoint'leri ---
-@app.get("/vms/list", response_model=VMListResponse, summary="Tüm VM'leri Listele")
+@app.get("/vms/list", response_model=VMListResponse)
 async def list_vms():
-    """Tüm sanal makinelerin listesini döndürür (optimize edilmiş)."""
+    """VM listesini döndürür."""
     try:
-        # Asenkron subprocess çağrısı için thread pool kullan
         loop = asyncio.get_event_loop()
-        output = await loop.run_in_executor(
+        result = await loop.run_in_executor(
             executor,
-            run_multipass_command,
-            [config.MULTIPASS_BIN, "list", "--format=json"]
+            run_multipass_command_old,
+            [os.getenv("MULTIPASS_BIN", "multipass"), "list", "--format=json"]
         )
-        data = json.loads(output)
+        data = json.loads(result)
         
         vms_raw = data.get("list", [])
         vms_final = []
 
         async def get_vm_info(vm_data):
             final_data = vm_data.copy()
-
-            state = final_data.get("state", "").lower()
-            cpus = final_data.get("cpus")
-            memory = final_data.get("memory")
-            disk = final_data.get("disk")
-
-            # Trigger fallback if resource info is missing, which is common for non-running VMs.
-            if not cpus or memory in [None, '-'] or disk in [None, '-']:
-                try:
-                    info_output = await loop.run_in_executor(
-                        executor,
-                        run_multipass_command,
-                        [config.MULTIPASS_BIN, "info", final_data["name"], "--format=json"]
-                    )
-                    info_data = json.loads(info_output).get("info", {}).get(final_data["name"], {})
-                    
-                    cpus_list = info_data.get("cpus", [])
-                    if cpus_list: final_data["cpus"] = cpus_list[0].get("value")
-
-                    memory_list = info_data.get("memory", [])
-                    if memory_list: final_data["memory"] = format_bytes(memory_list[0].get("value"))
-
-                    disk_list = info_data.get("disk", [])
-                    if disk_list: final_data["disk"] = format_bytes(disk_list[0].get("value"))
-
-                except Exception as e:
-                    print(f"Could not get info for {final_data['name']}: {e}")
             
             return VM(
                 name=final_data.get("name", ""),
@@ -381,132 +469,148 @@ async def list_vms():
         
         return VMListResponse(list=vms_final, total=len(vms_final))
     except Exception as e:
+        logger.error(f"list_vms hatası: {e}")
         raise HTTPException(500, f"VM listesi alınamadı: {str(e)}")
 
-@app.post("/vms/start/{vm_name}", response_model=StatusResponse, summary="VM'i Başlat")
+@app.post("/vms/start/{vm_name}", response_model=StatusResponse)
 async def start_vm(vm_name: str):
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(executor, run_multipass_command, ["multipass", "start", vm_name])
-    return {"status": "başlatıldı", "message": f"'{vm_name}' başlatıldı."}
+    await loop.run_in_executor(executor, run_multipass_command_old, ["multipass", "start", vm_name])
+    return StatusResponse(status="başlatıldı", message=f"'{vm_name}' başlatıldı.")
 
-@app.post("/vms/stop/{vm_name}", response_model=StatusResponse, summary="VM'i Durdur")
+@app.post("/vms/stop/{vm_name}", response_model=StatusResponse)
 async def stop_vm(vm_name: str):
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(executor, run_multipass_command, ["multipass", "stop", vm_name])
-    return {"status": "durduruldu", "message": f"'{vm_name}' durduruldu."}
+    await loop.run_in_executor(executor, run_multipass_command_old, ["multipass", "stop", vm_name])
+    return StatusResponse(status="durduruldu", message=f"'{vm_name}' durduruldu.")
 
-@app.delete("/vms/delete/{vm_name}", response_model=StatusResponse, summary="VM'i Sil")
+@app.delete("/vms/delete/{vm_name}", response_model=StatusResponse)
 async def delete_vm(vm_name: str):
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(executor, run_multipass_command, ["multipass", "delete", vm_name])
-    await loop.run_in_executor(executor, run_multipass_command, ["multipass", "purge"]) # Silinen VM'leri temizle
-    return {"status": "silindi", "message": f"'{vm_name}' silindi ve temizlendi."}
+    await loop.run_in_executor(executor, run_multipass_command_old, ["multipass", "delete", vm_name])
+    await loop.run_in_executor(executor, run_multipass_command_old, ["multipass", "purge"])
+    return StatusResponse(status="silindi", message=f"'{vm_name}' silindi ve temizlendi.")
 
-@app.post("/vms/create", response_model=StatusResponse, summary="Yeni VM Oluştur (Senkron)")
+@app.post("/vms/purge", response_model=StatusResponse)
+async def purge_vms():
+    """Silinen VM'leri tamamen temizler (purge komutu)."""
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(executor, run_multipass_command_old, ["multipass", "purge"])
+        return StatusResponse(status="temizlendi", message="Silinen sanal makineler tamamen temizlendi.")
+    except Exception as e:
+        logger.error(f"purge_vms hatası: {e}")
+        raise HTTPException(500, f"Temizleme işlemi başarısız: {str(e)}")
+
+@app.post("/vms/create", response_model=StatusResponse)
 async def create_vm(create_vm_request: CreateVMRequest):
-    """Senkron VM oluşturma - optimize edilmiş"""
+    """Senkron VM oluşturma."""
     vm_name = create_vm_request.name
     if not vm_name.replace('-', '').replace('_', '').isalnum():
         raise HTTPException(400, "VM adı sadece harf, rakam, tire ve alt çizgi içerebilir.")
     
     try:
-        # VM oluşturma komutu
-        command = [config.MULTIPASS_BIN, "launch", "--name", vm_name]
+        command = [os.getenv("MULTIPASS_BIN", "multipass"), "launch", "--name", vm_name]
         
-        # Ek yapılandırmayı ekle
         for key, value in create_vm_request.config.items():
             if key in ['cpus', 'memory', 'disk']:
                 command.extend([f"--{key}", value])
             else:
                 command.extend([f"--{key}", value])
         
-        # Asenkron subprocess çağrısı
         loop = asyncio.get_event_loop()
-        output = await loop.run_in_executor(executor, run_multipass_command, command)
+        output = await loop.run_in_executor(executor, run_multipass_command_old, command)
         return StatusResponse(status="created", message=f"Sanal makine '{vm_name}' başarıyla oluşturuldu.")
     
-    except subprocess.CalledProcessError as e:
-        error_msg = e.stderr.strip() if e.stderr else str(e)
-        if "already exists" in error_msg:
-            raise HTTPException(409, f"'{vm_name}' adında bir VM zaten var.")
-        elif "invalid" in error_msg.lower():
-            raise HTTPException(400, f"Geçersiz parametre: {error_msg}")
-        else:
-            raise HTTPException(500, f"VM oluşturma hatası: {error_msg}")
-            
     except Exception as e:
+        logger.error(f"create_vm hatası: {e}")
         raise HTTPException(500, f"VM oluşturma hatası: {str(e)}")
 
-@app.post("/vms/create-async", response_model=StatusResponse, summary="Yeni VM Oluştur (Asenkron)")
+@app.post("/vms/create-async", response_model=StatusResponse)
 async def create_vm_async(create_vm_request: CreateVMRequest):
-    """Asenkron VM oluşturma - arka planda çalışır, durumu /vms/status/{vm_name} ile kontrol edilir"""
+    """Asenkron VM oluşturma."""
     vm_name = create_vm_request.name
     if not vm_name.replace('-', '').replace('_', '').isalnum():
         raise HTTPException(400, "VM adı sadece harf, rakam, tire ve alt çizgi içerebilir.")
     
-    # Arka planda VM oluşturmaya başla
     asyncio.create_task(async_create_vm_background(vm_name, create_vm_request.config))
     
-    return {
-        "status": "started", 
-        "message": f"'{vm_name}' oluşturma işlemi başlatıldı."
-    }
+    return StatusResponse(
+        status="started", 
+        message=f"'{vm_name}' oluşturma işlemi başlatıldı."
+    )
 
-@app.get("/vms/status/{vm_name}", response_model=Dict, summary="VM Oluşturma Durumunu Kontrol Et")
-def get_vm_creation_status(vm_name: str):
-    """VM oluşturma durumunu kontrol eder"""
+@app.get("/vms/status/{vm_name}")
+async def get_vm_creation_status(vm_name: str):
+    """VM oluşturma durumunu kontrol eder."""
     if vm_name not in vm_creation_status:
         return {"status": "unknown", "message": f"'{vm_name}' için oluşturma işlemi bulunamadı."}
     
     return vm_creation_status[vm_name]
 
-@app.get("/", summary="API Durumu")
-def root():
-    """API'nin temel bilgilerini döndürür"""
+@app.get("/")
+async def root():
+    """API durumu."""
     return {
         "message": "Multipass VM Management API çalışıyor",
         "version": "3.1.0",
-        "multipass_bin": config.MULTIPASS_BIN
+        "multipass_bin": os.getenv("MULTIPASS_BIN", "multipass")
     }
 
-@app.get("/health", summary="Sağlık Kontrolü")
-def health_check():
-    """API'nin ve Multipass'ın çalışıp çalışmadığını kontrol eder"""
+@app.get("/health")
+async def health_check():
+    """Sağlık kontrolü."""
     try:
-        # Multipass'ın çalışıp çalışmadığını kontrol et
-        version_output = run_multipass_command(["multipass", "version"], timeout=10)
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            executor, 
+            run_multipass_command, 
+            [os.getenv("MULTIPASS_BIN", "multipass"), "version"]
+        )
+        
+        if "error" in result:
+            return {
+                "status": "unhealthy", 
+                "multipass": "unavailable",
+                "error": result["error"],
+                "multipass_bin": os.getenv("MULTIPASS_BIN", "multipass")
+            }
+        
         return {
             "status": "healthy", 
             "multipass": "available", 
-            "version": version_output.strip(),
-            "multipass_bin": config.MULTIPASS_BIN
+            "version": result.get("output", "").strip(),
+            "multipass_bin": os.getenv("MULTIPASS_BIN", "multipass")
         }
     except Exception as e:
+        logger.error(f"Health check hatası: {e}")
         return {
             "status": "unhealthy", 
             "multipass": "unavailable",
             "error": str(e),
-            "multipass_bin": MULTIPASS_BIN
+            "multipass_bin": os.getenv("MULTIPASS_BIN", "multipass")
         }
 
-# --- AI Chat Endpoints ---
-
+# --- DÜZELTILEN CHAT ENDPOINT ---
 @app.post("/chat")
 async def chat_endpoint(request: LegacyChatRequest):
     """Kullanıcıdan gelen mesajı işler ve gerekli komutları çalıştırır."""
     try:
-        # Eğer doğrudan multipass komutu gelmişse
+        logger.info(f"Chat endpoint çağrıldı. Message: {request.message[:100]}...")
+        
+        # Doğrudan multipass komutu kontrolü
         if request.message.strip().startswith('multipass '):
-            command = request.message.strip()[len('multipass '):].strip()  # "multipass " kısmını kaldır
+            logger.info("Doğrudan multipass komutu tespit edildi")
+            command = request.message.strip()[len('multipass '):].strip()
             result = await execute_vm_action_direct(command)
             
-            if 'error' in result:
+            if not result.get('success', False):
                 return {
-                    "response": f"❌ Hata: {result['error']}",
+                    "response": f"❌ Hata: {result.get('error', 'Bilinmeyen hata')}",
                     "execution_results": [{
                         "success": False,
                         "operation": "direct_command",
-                        "details": result.get('error')
+                        "details": result.get('error', 'Bilinmeyen hata')
                     }]
                 }
             
@@ -515,16 +619,47 @@ async def chat_endpoint(request: LegacyChatRequest):
                 "execution_results": [{
                     "success": True,
                     "operation": "direct_command",
-                    "details": result.get('message')
+                    "details": result.get('message', 'Başarılı')
                 }]
             }
     
         # AI ile işlem yapma kısmı
-        async with httpx.AsyncClient(timeout=config.REQUEST_TIMEOUT) as client:
-            # Legacy formatı Ollama formatına çevir
-            ollama_request = {
-                "model": os.getenv("OLLAMA_MODEL"),
-                "prompt": f"""Sen, Multipass sanal makinelerini yöneten ve her zaman Türkçe cevap veren yardımsever bir asistansın. 
+        logger.info("AI ile işlem başlatılıyor")
+        
+        # OLLAMA_URL ve OLLAMA_MODEL kontrolü
+        ollama_url = os.getenv("OLLAMA_URL")
+        ollama_model = os.getenv("OLLAMA_MODEL")
+        
+        if not ollama_url:
+            logger.error("OLLAMA_URL tanımlı değil")
+            return {
+                "response": "❌ Hata: OLLAMA_URL environment variable tanımlı değil. Lütfen yapılandırmanızı kontrol edin.",
+                "execution_results": [{
+                    "success": False,
+                    "operation": "ai_config_check",
+                    "details": "OLLAMA_URL environment variable is not set"
+                }]
+            }
+        
+        if not ollama_model:
+            logger.error("OLLAMA_MODEL tanımlı değil")
+            return {
+                "response": "❌ Hata: OLLAMA_MODEL environment variable tanımlı değil. Lütfen yapılandırmanızı kontrol edin.",
+                "execution_results": [{
+                    "success": False,
+                    "operation": "ai_config_check",
+                    "details": "OLLAMA_MODEL environment variable is not set"
+                }]
+            }
+        
+        logger.info(f"Ollama URL: {ollama_url}, Model: {ollama_model}")
+        
+        # AI ile iletişim
+        try:
+            async with httpx.AsyncClient(timeout=config.REQUEST_TIMEOUT) as client:
+                ollama_request = {
+                    "model": ollama_model,
+                    "prompt": f"""Sen, Multipass sanal makinelerini yöneten ve her zaman Türkçe cevap veren yardımsever bir asistansın. 
 
 ÖNEMLİ KURALLAR:
 1. Tüm multipass komutlarını HER ZAMAN ```multipass ...``` şeklinde ver
@@ -540,23 +675,59 @@ async def chat_endpoint(request: LegacyChatRequest):
 
 Kullanıcı: {request.message}
 Asistan:""",
-                "stream": False
+                    "stream": False
+                }
+                
+                logger.info("Ollama'ya istek gönderiliyor")
+                
+                response = await client.post(f"{ollama_url}/api/generate", json=ollama_request)
+                response.raise_for_status()
+                ai_response = response.json()
+                ai_message = ai_response.get("response", "")
+                
+                logger.info(f"AI yanıtı alındı, uzunluk: {len(ai_message)}")
+                
+        except httpx.RequestError as e:
+            logger.error(f"Ollama RequestError: {e}")
+            return {
+                "response": f"❌ Hata: Ollama sunucusuna ulaşılamadı. Sunucunun çalıştığından emin olun.\n\nDetay: {str(e)}",
+                "execution_results": [{
+                    "success": False,
+                    "operation": "ai_request",
+                    "details": f"Ollama RequestError: {str(e)}"
+                }]
             }
-            
-            # Mesajı Ollama'ya gönder
-            response = await client.post(f"{os.getenv('OLLAMA_URL')}/api/generate", json=ollama_request)
-            response.raise_for_status()
-            ai_response = response.json()
-            ai_message = ai_response.get("response", "")
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Ollama HTTPStatusError: {e}")
+            error_text = e.response.text if hasattr(e, 'response') and e.response else str(e)
+            return {
+                "response": f"❌ Hata: Ollama API hatası.\n\nDetay: {error_text}",
+                "execution_results": [{
+                    "success": False,
+                    "operation": "ai_request",
+                    "details": f"Ollama HTTPStatusError: {error_text}"
+                }]
+            }
+        except Exception as e:
+            logger.error(f"AI request genel hatası: {e}")
+            return {
+                "response": f"❌ Hata: AI ile iletişim kurulurken beklenmeyen bir hata oluştu.\n\nDetay: {str(e)}",
+                "execution_results": [{
+                    "success": False,
+                    "operation": "ai_request",
+                    "details": f"Unexpected AI error: {str(e)}"
+                }]
+            }
 
-            # AI yanıtından komut çıkar ve çalıştır
-            command = extract_multipass_command(ai_message)
-            execution_results = []
-            
-            if command:
-                print(f"AI'dan çıkarılan komut: {command}")  # Debug
+        # AI yanıtından komut çıkar ve çalıştır
+        command = extract_multipass_command(ai_message)
+        execution_results = []
+        
+        if command:
+            logger.info(f"AI'dan çıkarılan komut: {command}")
+            try:
                 execution_result = await execute_vm_action_direct(command)
-                print(f"Çalıştırma sonucu: {execution_result}")  # Debug
+                logger.info(f"Çalıştırma sonucu: {execution_result}")
                 
                 execution_results.append({
                     "success": execution_result.get("success", False),
@@ -566,7 +737,6 @@ Asistan:""",
                 })
                 
                 # Sonucu AI mesajına ekle
-                # Asenkron oluşturma işlemi için özel durum kontrolü
                 is_async_creation = execution_result.get("status") == "started"
 
                 if execution_result.get("success") or is_async_creation:
@@ -575,38 +745,50 @@ Asistan:""",
                 else:
                     error_text = execution_result.get("error", "Bilinmeyen hata")
                     ai_message += f"\n\n❌ **Hata:** {error_text}"
-            else:
-                print("AI mesajından komut çıkarılamadı")  # Debug
-                print(f"AI mesajı: {ai_message}")  # Debug
-            
-            # Legacy format için response döndür
-            return {
-                "response": ai_message,
-                "execution_results": execution_results
-            }
+                    
+            except Exception as command_error:
+                logger.error(f"Komut çalıştırma hatası: {command_error}")
+                execution_results.append({
+                    "success": False,
+                    "operation": "multipass_command", 
+                    "command": command,
+                    "details": f"Komut çalıştırma hatası: {str(command_error)}"
+                })
+                ai_message += f"\n\n❌ **Komut Çalıştırma Hatası:** {str(command_error)}"
+        else:
+            logger.info("AI mesajından komut çıkarılamadı")
+        
+        logger.info("Chat endpoint başarıyla tamamlandı")
+        
+        return {
+            "response": ai_message,
+            "execution_results": execution_results
+        }
 
-    except httpx.RequestError as e:
-        raise HTTPException(503, f"Ollama sunucusuna ulaşılamadı: {str(e)}")
-    except httpx.HTTPStatusError as e:
-        error_text = e.response.text if hasattr(e, 'response') and e.response else str(e)
-        raise HTTPException(e.response.status_code if hasattr(e, 'response') and e.response else 500, 
-                         f"Ollama API hatası: {error_text}")
     except Exception as e:
-        raise HTTPException(500, f"Beklenmeyen bir hata oluştu: {str(e)}")
+        logger.error(f"Chat endpoint genel hatası: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return {
+            "response": f"❌ Beklenmeyen bir hata oluştu: {str(e)}",
+            "execution_results": [{
+                "success": False,
+                "operation": "chat_endpoint",
+                "details": f"Unexpected error: {str(e)}"
+            }]
+        }
 
 @app.get("/vms/list-ai", response_model=AIVMListResponse)
 async def list_vms_ai():
-    """VM listesini AI proxy formatında döndürür (frontend uyumluluğu için)."""
+    """VM listesini AI proxy formatında döndürür."""
     try:
-        # Mevcut list_vms fonksiyonunu kullan
-        vm_list_response = list_vms()
-        return {"success": True, "vms": vm_list_response.list}
+        vm_list_response = await list_vms()
+        return AIVMListResponse(success=True, vms=vm_list_response.list)
     except Exception as e:
+        logger.error(f"list_vms_ai hatası: {e}")
         error_message = str(e)
-        return {"success": False, "vms": [], "error": f"VM listesi alınamadı: {error_message}"}
+        return AIVMListResponse(success=False, vms=[], error=f"VM listesi alınamadı: {error_message}")
 
 if __name__ == "__main__":
     import uvicorn
-    # .env dosyasından portu al, bulunamazsa 8001 kullan
     port = int(os.getenv("PROXY_SERVER_PORT", 8001))
     uvicorn.run(app, host="0.0.0.0", port=port)
