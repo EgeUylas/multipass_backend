@@ -10,8 +10,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
-import config
+import os
+from dotenv import load_dotenv
 import asyncio
+
+# .env dosyasını yükle
+load_dotenv()
 
 app = FastAPI(
     title="Multipass VM Management & AI Proxy API",
@@ -83,7 +87,7 @@ def format_bytes(byte_val):
 def run_multipass_command(command: list, timeout=300):
     try:
         if command[0] == "multipass": 
-            command[0] = config.MULTIPASS_BIN
+            command[0] = os.getenv("MULTIPASS_BIN", "multipass")
         
         print(f"Çalıştırılacak komut: {' '.join(command)}")  # Debug için
         
@@ -519,7 +523,7 @@ async def chat_endpoint(request: LegacyChatRequest):
         async with httpx.AsyncClient(timeout=config.REQUEST_TIMEOUT) as client:
             # Legacy formatı Ollama formatına çevir
             ollama_request = {
-                "model": config.OLLAMA_MODEL,
+                "model": os.getenv("OLLAMA_MODEL"),
                 "prompt": f"""Sen, Multipass sanal makinelerini yöneten ve her zaman Türkçe cevap veren yardımsever bir asistansın. 
 
 ÖNEMLİ KURALLAR:
@@ -540,7 +544,7 @@ Asistan:""",
             }
             
             # Mesajı Ollama'ya gönder
-            response = await client.post(f"{config.OLLAMA_URL}/api/generate", json=ollama_request)
+            response = await client.post(f"{os.getenv('OLLAMA_URL')}/api/generate", json=ollama_request)
             response.raise_for_status()
             ai_response = response.json()
             ai_message = ai_response.get("response", "")
@@ -603,4 +607,6 @@ async def list_vms_ai():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=config.PROXY_SERVER_PORT)
+    # .env dosyasından portu al, bulunamazsa 8001 kullan
+    port = int(os.getenv("PROXY_SERVER_PORT", 8001))
+    uvicorn.run(app, host="0.0.0.0", port=port)
