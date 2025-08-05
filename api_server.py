@@ -16,8 +16,11 @@ import asyncio
 import logging
 import traceback
 
-# Logging yapılandırması
-logging.basicConfig(level=logging.INFO)
+# Logging yapılandırması - LOG SEVİYESİNİ AYARLA
+logging.basicConfig(
+    level=logging.WARNING,  # INFO'dan WARNING'e düşürüldü
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # .env dosyasını yükle
@@ -26,7 +29,7 @@ load_dotenv()
 app = FastAPI(
     title="Multipass VM Management & AI Proxy API",
     description="Multipass sanal makinelerini yönetmek ve AI ile etkileşim kurmak için birleşik API",
-    version="3.1.0"
+    version="3.1.1"  # Versiyon güncellendi
 )
 
 app.add_middleware(
@@ -40,6 +43,13 @@ app.add_middleware(
 # VM oluşturma durumlarını takip etmek için
 vm_creation_status: Dict[str, Dict] = {}
 executor = ThreadPoolExecutor(max_workers=3)
+
+# CACHE MEKANIZMASI EKLENDI
+vm_list_cache = {
+    "data": None,
+    "timestamp": 0,
+    "cache_duration": 5  # 5 saniye cache
+}
 
 # Config sınıfı
 class Config:
@@ -98,7 +108,10 @@ def format_bytes(byte_val):
 def run_multipass_command(command: list, timeout=300):
     try:
         multipass_path = os.getenv("MULTIPASS_BIN", r"C:\Program Files\Multipass\bin\multipass.exe")
-        logger.info(f"Multipass path: {multipass_path}")
+        
+        # LOG SEVİYESİ DÜŞÜRÜLDÜ
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Multipass path: {multipass_path}")
 
         if not os.path.exists(multipass_path):
             logger.error(f"Multipass executable not found at path: {multipass_path}")
@@ -106,7 +119,10 @@ def run_multipass_command(command: list, timeout=300):
 
         command[0] = multipass_path
         command_str = ' '.join(f'"{c}"' if ' ' in c else c for c in command)
-        logger.info(f"Executing command: {command_str}")
+        
+        # SADECE CRITICAL KOMUTLARDA LOG
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Executing command: {command_str}")
 
         result = subprocess.run(
             command_str,
@@ -119,7 +135,10 @@ def run_multipass_command(command: list, timeout=300):
             errors='replace'
         )
         
-        logger.info(f"Command executed successfully")
+        # LOG SEVİYESİ DÜŞÜRÜLDÜ
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Command executed successfully")
+        
         return {"success": True, "output": result.stdout}
 
     except FileNotFoundError as e:
@@ -140,7 +159,9 @@ def run_multipass_command_old(command: list, timeout=300):
     """Eski endpoint'ler için uyumluluk (exception fırlatan versiyon)"""
     try:
         multipass_path = os.getenv("MULTIPASS_BIN", r"C:\Program Files\Multipass\bin\multipass.exe")
-        logger.info(f"Multipass path: {multipass_path}")
+        
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Multipass path: {multipass_path}")
 
         if not os.path.exists(multipass_path):
             logger.error(f"Multipass executable not found at path: {multipass_path}")
@@ -148,7 +169,9 @@ def run_multipass_command_old(command: list, timeout=300):
 
         command[0] = multipass_path
         command_str = ' '.join(f'"{c}"' if ' ' in c else c for c in command)
-        logger.info(f"Executing command: {command_str}")
+        
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Executing command: {command_str}")
 
         result = subprocess.run(
             command_str,
@@ -161,7 +184,9 @@ def run_multipass_command_old(command: list, timeout=300):
             errors='replace'
         )
         
-        logger.info(f"Command executed successfully")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Command executed successfully")
+        
         return result.stdout
 
     except FileNotFoundError as e:
@@ -183,7 +208,8 @@ def run_multipass_command_old(command: list, timeout=300):
 def extract_multipass_command(text: str) -> Optional[str]:
     """Metin içinden multipass komutunu çıkarır."""
     try:
-        logger.info(f"Komut çıkarma deneniyor: {text[:200]}...")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Komut çıkarma deneniyor: {text[:200]}...")
         
         # 1. Markdown kod bloğu
         patterns = [
@@ -197,7 +223,8 @@ def extract_multipass_command(text: str) -> Optional[str]:
             match = re.search(pattern, text, re.DOTALL)
             if match:
                 command = match.group(1).strip()
-                logger.info(f"Markdown'dan çıkarılan komut: {command}")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"Markdown'dan çıkarılan komut: {command}")
                 return normalize_multipass_command(command)
 
         # 2. Satır satır arama
@@ -211,17 +238,20 @@ def extract_multipass_command(text: str) -> Optional[str]:
 
             if cleaned_line.startswith("multipass "):
                 command = cleaned_line[len("multipass "):].strip()
-                logger.info(f"Satırdan çıkarılan komut: {command}")
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"Satırdan çıkarılan komut: {command}")
                 return normalize_multipass_command(command)
         
         # 3. Basit regex araması
         simple_match = re.search(r"multipass\s+(\w+(?:\s+--?\w+(?:\s+\S+)?)*)", text)
         if simple_match:
             command = simple_match.group(1).strip()
-            logger.info(f"Regex'den çıkarılan komut: {command}")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"Regex'den çıkarılan komut: {command}")
             return normalize_multipass_command(command)
         
-        logger.info("Hiçbir komut bulunamadı")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Hiçbir komut bulunamadı")
         return None
         
     except Exception as e:
@@ -249,10 +279,28 @@ def normalize_multipass_command(command: str) -> str:
         logger.error(f"normalize_multipass_command hatası: {e}")
         return command
 
+# CACHE KONTROLÜ EKLENDI
+def is_cache_valid() -> bool:
+    """Cache'in geçerli olup olmadığını kontrol eder."""
+    current_time = time.time()
+    return (vm_list_cache["data"] is not None and 
+            current_time - vm_list_cache["timestamp"] < vm_list_cache["cache_duration"])
+
+def update_vm_cache(data: List[VM]):
+    """VM cache'ini günceller."""
+    vm_list_cache["data"] = data
+    vm_list_cache["timestamp"] = time.time()
+
+def clear_vm_cache():
+    """VM cache'ini temizler."""
+    vm_list_cache["data"] = None
+    vm_list_cache["timestamp"] = 0
+
 async def execute_vm_action_direct(command: str) -> Dict[str, Any]:
     """Doğrudan Multipass komutunu çalıştırır."""
     try:
-        logger.info(f"execute_vm_action_direct başlatıldı: {command}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"execute_vm_action_direct başlatıldı: {command}")
         
         command = normalize_multipass_command(command)
         args = shlex.split(command)
@@ -264,7 +312,12 @@ async def execute_vm_action_direct(command: str) -> Dict[str, Any]:
             return {"success": False, "error": "Geçersiz komut"}
             
         action = args[0]
-        logger.info(f"Action: {action}")
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"Action: {action}")
+        
+        # CACHE TEMİZLEME - VM durumu değişecek işlemlerde cache'i temizle
+        if action in ["launch", "start", "stop", "delete", "purge"]:
+            clear_vm_cache()
         
         if action == "launch":
             vm_name = None
@@ -403,9 +456,12 @@ async def async_create_vm_background(vm_name: str, config_dict: Dict):
             }
             return
         
+        # Cache'i temizle çünkü yeni VM eklendi
+        clear_vm_cache()
+        
         time.sleep(3)
         
-        # VM bilgilerini al
+        # VM bilgilerini al - ANCAK TEK SEFERLIK
         try:
             info_result = await loop.run_in_executor(executor, run_multipass_command, ["multipass", "info", vm_name, "--format", "json"])
             if "error" not in info_result:
@@ -437,8 +493,15 @@ async def async_create_vm_background(vm_name: str, config_dict: Dict):
 # --- API Endpoint'leri ---
 @app.get("/vms/list", response_model=VMListResponse)
 async def list_vms():
-    """VM listesini döndürür."""
+    """VM listesini döndürür - CACHE MEKANİZMASI İLE."""
     try:
+        # Cache kontrol et
+        if is_cache_valid():
+            logger.info("VM listesi cache'den döndürülüyor")
+            return VMListResponse(list=vm_list_cache["data"], total=len(vm_list_cache["data"]))
+        
+        logger.info("VM listesi Multipass'dan alınıyor")
+        
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             executor,
@@ -450,22 +513,22 @@ async def list_vms():
         vms_raw = data.get("list", [])
         vms_final = []
 
-        async def get_vm_info(vm_data):
-            final_data = vm_data.copy()
-            
-            return VM(
-                name=final_data.get("name", ""),
-                state=final_data.get("state", ""),
-                ipv4=final_data.get("ipv4", []),
-                release=final_data.get("release", ""),
-                cpus=str(final_data.get("cpus")) if final_data.get("cpus") else None,
-                memory=str(final_data.get("memory")) if final_data.get("memory") else None,
-                disk=str(final_data.get("disk")) if final_data.get("disk") else None,
-                image_hash=final_data.get("image_hash", "")
+        # BASİTLEŞTİRİLDİ - HER VM İÇİN AYRI ÇAĞRI YOK
+        for vm_data in vms_raw:
+            vm = VM(
+                name=vm_data.get("name", ""),
+                state=vm_data.get("state", ""),
+                ipv4=vm_data.get("ipv4", []),
+                release=vm_data.get("release", ""),
+                cpus=str(vm_data.get("cpus")) if vm_data.get("cpus") else None,
+                memory=str(vm_data.get("memory")) if vm_data.get("memory") else None,
+                disk=str(vm_data.get("disk")) if vm_data.get("disk") else None,
+                image_hash=vm_data.get("image_hash", "")
             )
-
-        tasks = [get_vm_info(vm) for vm in vms_raw]
-        vms_final = await asyncio.gather(*tasks)
+            vms_final.append(vm)
+        
+        # Cache'i güncelle
+        update_vm_cache(vms_final)
         
         return VMListResponse(list=vms_final, total=len(vms_final))
     except Exception as e:
@@ -474,18 +537,21 @@ async def list_vms():
 
 @app.post("/vms/start/{vm_name}", response_model=StatusResponse)
 async def start_vm(vm_name: str):
+    clear_vm_cache()  # Cache temizle
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(executor, run_multipass_command_old, ["multipass", "start", vm_name])
     return StatusResponse(status="başlatıldı", message=f"'{vm_name}' başlatıldı.")
 
 @app.post("/vms/stop/{vm_name}", response_model=StatusResponse)
 async def stop_vm(vm_name: str):
+    clear_vm_cache()  # Cache temizle
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(executor, run_multipass_command_old, ["multipass", "stop", vm_name])
     return StatusResponse(status="durduruldu", message=f"'{vm_name}' durduruldu.")
 
 @app.delete("/vms/delete/{vm_name}", response_model=StatusResponse)
 async def delete_vm(vm_name: str):
+    clear_vm_cache()  # Cache temizle
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(executor, run_multipass_command_old, ["multipass", "delete", vm_name])
     await loop.run_in_executor(executor, run_multipass_command_old, ["multipass", "purge"])
@@ -495,6 +561,7 @@ async def delete_vm(vm_name: str):
 async def purge_vms():
     """Silinen VM'leri tamamen temizler (purge komutu)."""
     try:
+        clear_vm_cache()  # Cache temizle
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(executor, run_multipass_command_old, ["multipass", "purge"])
         return StatusResponse(status="temizlendi", message="Silinen sanal makineler tamamen temizlendi.")
@@ -510,6 +577,7 @@ async def create_vm(create_vm_request: CreateVMRequest):
         raise HTTPException(400, "VM adı sadece harf, rakam, tire ve alt çizgi içerebilir.")
     
     try:
+        clear_vm_cache()  # Cache temizle
         command = [os.getenv("MULTIPASS_BIN", "multipass"), "launch", "--name", vm_name]
         
         for key, value in create_vm_request.config.items():
@@ -533,6 +601,7 @@ async def create_vm_async(create_vm_request: CreateVMRequest):
     if not vm_name.replace('-', '').replace('_', '').isalnum():
         raise HTTPException(400, "VM adı sadece harf, rakam, tire ve alt çizgi içerebilir.")
     
+    clear_vm_cache()  # Cache temizle
     asyncio.create_task(async_create_vm_background(vm_name, create_vm_request.config))
     
     return StatusResponse(
@@ -553,8 +622,10 @@ async def root():
     """API durumu."""
     return {
         "message": "Multipass VM Management API çalışıyor",
-        "version": "3.1.0",
-        "multipass_bin": os.getenv("MULTIPASS_BIN", "multipass")
+        "version": "3.1.1",  # Güncellendi
+        "multipass_bin": os.getenv("MULTIPASS_BIN", "multipass"),
+        "cache_enabled": True,
+        "cache_duration": vm_list_cache["cache_duration"]
     }
 
 @app.get("/health")
@@ -580,7 +651,8 @@ async def health_check():
             "status": "healthy", 
             "multipass": "available", 
             "version": result.get("output", "").strip(),
-            "multipass_bin": os.getenv("MULTIPASS_BIN", "multipass")
+            "multipass_bin": os.getenv("MULTIPASS_BIN", "multipass"),
+            "cache_status": "enabled" if is_cache_valid() else "empty"
         }
     except Exception as e:
         logger.error(f"Health check hatası: {e}")
@@ -756,7 +828,8 @@ Asistan:""",
                 })
                 ai_message += f"\n\n❌ **Komut Çalıştırma Hatası:** {str(command_error)}"
         else:
-            logger.info("AI mesajından komut çıkarılamadı")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("AI mesajından komut çıkarılamadı")
         
         logger.info("Chat endpoint başarıyla tamamlandı")
         
@@ -787,6 +860,23 @@ async def list_vms_ai():
         logger.error(f"list_vms_ai hatası: {e}")
         error_message = str(e)
         return AIVMListResponse(success=False, vms=[], error=f"VM listesi alınamadı: {error_message}")
+
+# CACHE TEMİZLEME ENDPOİNTİ EKLENDI
+@app.post("/vms/cache/clear")
+async def clear_cache():
+    """VM cache'ini manuel olarak temizler."""
+    clear_vm_cache()
+    return {"message": "VM cache temizlendi", "timestamp": time.time()}
+
+@app.get("/vms/cache/status")
+async def cache_status():
+    """Cache durumunu gösterir."""
+    return {
+        "cache_valid": is_cache_valid(),
+        "cache_timestamp": vm_list_cache["timestamp"],
+        "cache_duration": vm_list_cache["cache_duration"],
+        "cached_vm_count": len(vm_list_cache["data"]) if vm_list_cache["data"] else 0
+    }
 
 if __name__ == "__main__":
     import uvicorn
